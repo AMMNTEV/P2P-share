@@ -14,12 +14,17 @@ const CHUNK_SIZE = 16 * 1024;
 const BUFFER_THRESHOLD = 1024 * 1024;
 const BUFFER_LOW = 256 * 1024;
 
-// Набор публичных STUN/TURN серверов с фоллбэками
 const RTC_CONFIG = {
   iceServers: [
+    // STUN серверы
     { urls: 'stun:stun.l.google.com:19302' },
     { urls: 'stun:stun1.l.google.com:19302' },
     { urls: 'stun:stun2.l.google.com:19302' },
+    { urls: 'stun:stun3.l.google.com:19302' },
+    { urls: 'stun:stun4.l.google.com:19302' },
+    { urls: 'stun:global.stun.twilio.com:3478' },
+    
+    // Публичные рабочей конфигурации TURN (OpenRelay)
     {
       urls: [
         'turn:openrelay.metered.ca:80',
