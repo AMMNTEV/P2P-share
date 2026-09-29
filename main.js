@@ -1,6 +1,6 @@
 // ============================================
 // main.js — P2P передача файлов через WebRTC
-// Мультифайл + надёжный сигналинг
+// Мультифайл + Публичный TURN + Исправленный сигналинг
 // ============================================
 import {
   createRoom, joinRoom,
@@ -14,12 +14,11 @@ const CHUNK_SIZE = 16 * 1024;
 const BUFFER_THRESHOLD = 1024 * 1024;
 const BUFFER_LOW = 256 * 1024;
 
+// STUN + Бесплатный публичный TURN без регистрации от Open Relay
 const RTC_CONFIG = {
   iceServers: [
     { urls: 'stun:stun.l.google.com:19302' },
     { urls: 'stun:stun1.l.google.com:19302' },
-    
-    // Публичный TURN от Open Relay (без регистрации)
     {
       urls: [
         'turn:openrelay.metered.ca:80',
@@ -49,8 +48,6 @@ let appliedOffer = false;
 let appliedAnswer = false;
 let appliedSenderIceCount = 0;
 let appliedReceiverIceCount = 0;
-let remoteDescSet = false;
-let pendingIceCandidates = [];
 
 let sendingStarted = false;
 
@@ -121,7 +118,7 @@ function totalSize(files) {
 }
 
 // ============================================
-// UI: список файлов (отправитель)
+// UI
 // ============================================
 function renderFilesList() {
   if (selectedFiles.length === 0) {
@@ -177,9 +174,6 @@ function markWaitFileDone(index) {
   if (items[index]) items[index].classList.add('done');
 }
 
-// ============================================
-// UI: список файлов (получатель)
-// ============================================
 function renderRecvFilesList() {
   recvFilesList.innerHTML = '';
   receivedFiles.forEach((f) => {
@@ -217,7 +211,7 @@ function downloadBlob(blob, name) {
   document.body.appendChild(a);
   a.click();
   a.remove();
-  setTimeout(() => URL.revokeObjectURL(url), 60_000);
+  setTimeout(() => URL.revokeObjectURL(url), 60000);
 }
 
 // ============================================
@@ -239,34 +233,23 @@ function createPeerConnection() {
       } catch (e) {
         console.warn('[ICE send]', e);
       }
-    } else if (!event.candidate) {
-      log('ICE gathering завершён');
     }
-  };
-
-  pc.oniceconnectionstatechange = () => {
-    log('ICE state:', pc.iceConnectionState);
   };
 
   pc.onconnectionstatechange = () => {
     log('PC state:', pc.connectionState);
-    if (pc.connectionState === 'failed') {
-      waitStatus.textContent = 'Соединение не установлено';
-      waitStatus.className = 'status err';
-    }
-    if (pc.connectionState === 'disconnected') {
+    if (pc.connectionState === 'failed' || pc.connectionState === 'disconnected') {
       waitStatus.textContent = 'Соединение потеряно';
       waitStatus.className = 'status err';
     }
   };
 
   if (role === 'sender') {
-    log('Создаю DataChannel');
     dataChannel = pc.createDataChannel('file', { ordered: true });
     setupDataChannel();
   } else {
     pc.ondatachannel = (event) => {
-      log('Получен DataChannel от отправителя');
+      log('Получен DataChannel');
       dataChannel = event.channel;
       setupDataChannel();
     };
@@ -275,9 +258,20 @@ function createPeerConnection() {
   return pc;
 }
 
-// ============================================
-// DataChannel
-// ============================================
+function waitForIceGathering(pc) {
+  return new Promise((resolve) => {
+    if (pc.iceGatheringState === 'complete') return resolve();
+    const check = () => {
+      if (pc.iceGatheringState === 'complete') {
+        pc.removeEventListener('icegatheringstatechange', check);
+        resolve();
+      }
+    };
+    pc.addEventListener('icegatheringstatechange', check);
+    setTimeout(resolve, 2500); // Таймаут на случай медленных кандидатов
+  });
+}
+
 function setupDataChannel() {
   dataChannel.binaryType = 'arraybuffer';
 
@@ -297,9 +291,6 @@ function setupDataChannel() {
     }
   };
 
-  dataChannel.onclose = () => log('DataChannel закрыт');
-  dataChannel.onerror = (e) => console.error('[DC error]', e);
-
   if (role === 'receiver') {
     dataChannel.onmessage = (event) => {
       const data = event.data;
@@ -309,7 +300,6 @@ function setupDataChannel() {
         try { msg = JSON.parse(data); } catch { return; }
 
         if (msg.type === 'meta') {
-          log('Новый файл:', msg.name, formatSize(msg.size));
           currentRecvFile = msg;
           currentRecvChunks = [];
           currentRecvBytes = 0;
@@ -323,7 +313,6 @@ function setupDataChannel() {
 
         if (msg.type === 'end') {
           if (currentRecvFile) {
-            log('Файл завершён:', currentRecvFile.name);
             const blob = new Blob(currentRecvChunks, {
               type: currentRecvFile.mime || 'application/octet-stream'
             });
@@ -342,7 +331,6 @@ function setupDataChannel() {
         }
 
         if (msg.type === 'all-done') {
-          log('Все файлы получены');
           onAllReceived();
           return;
         }
@@ -364,25 +352,19 @@ function setupDataChannel() {
   }
 }
 
-// ============================================
-// Отправитель: отправка файлов по порядку
-// ============================================
 async function sendAllFiles() {
   try {
     for (let i = 0; i < selectedFiles.length; i++) {
       const file = selectedFiles[i];
-      log(`Отправляю файл ${i + 1}/${selectedFiles.length}:`, file.name);
       await sendOneFile(file, i);
       markWaitFileDone(i);
     }
 
-    log('Все файлы отправлены, шлю all-done');
     dataChannel.send(JSON.stringify({ type: 'all-done' }));
     waitStatus.textContent = 'Все файлы отправлены ✓';
     waitStatus.className = 'status ok';
 
     if (roomId) await markSenderDone(roomId);
-    scheduleCleanup();
   } catch (e) {
     console.error('[SEND]', e);
     waitStatus.textContent = 'Ошибка отправки';
@@ -436,9 +418,6 @@ function readChunk(file, offset, size) {
   });
 }
 
-// ============================================
-// Получатель: все получено
-// ============================================
 async function onAllReceived() {
   recvStatus.textContent = `Получено файлов: ${receivedFiles.length} ✓`;
   recvStatus.className = 'status ok';
@@ -447,7 +426,6 @@ async function onAllReceived() {
   downloadAllBtn.style.display = 'block';
 
   if (roomId) await markReceiverDone(roomId);
-  scheduleCleanup();
 }
 
 downloadAllBtn.addEventListener('click', () => {
@@ -457,116 +435,62 @@ downloadAllBtn.addEventListener('click', () => {
 });
 
 // ============================================
-// Очистка: отложенная, через 10 сек
-// ============================================
-let cleanupScheduled = false;
-function scheduleCleanup() {
-  if (cleanupScheduled) return;
-  cleanupScheduled = true;
-  setTimeout(async () => {
-    if (roomId) {
-      log('Очищаю Firestore');
-      await cleanupRoom(roomId);
-      roomId = null;
-    }
-  }, 10000);
-}
-
-// ============================================
-// Обработка изменений комнаты
+// Обработка сигналов из Firestore
 // ============================================
 async function handleRoomUpdate(data) {
-  if (!pc) {
-    log('PC не создан, игнорирую обновление');
-    return;
-  }
+  if (!pc) return;
 
-  // OFFER (только для получателя)
+  // OFFER (Receiver)
   if (role === 'receiver' && data.offer && !appliedOffer) {
-    log('Получен offer');
     appliedOffer = true;
     try {
       await pc.setRemoteDescription(new RTCSessionDescription(data.offer));
-      remoteDescSet = true;
-      await flushPendingIce();
-
       const answer = await pc.createAnswer();
       await pc.setLocalDescription(answer);
 
-      log('Отправляю answer');
+      await waitForIceGathering(pc);
       await setAnswer(roomId, pc.localDescription.sdp);
     } catch (e) {
       console.error('[handle offer]', e);
     }
   }
 
-  // ANSWER (только для отправителя)
+  // ANSWER (Sender)
   if (role === 'sender' && data.answer && !appliedAnswer) {
-    log('Получен answer');
     appliedAnswer = true;
     try {
       await pc.setRemoteDescription(new RTCSessionDescription(data.answer));
-      remoteDescSet = true;
-      await flushPendingIce();
     } catch (e) {
       console.error('[handle answer]', e);
     }
   }
 
-  // ICE от sender — применяет receiver
+  // ICE от Sender -> Применяет Receiver
   if (role === 'receiver' && Array.isArray(data.iceSender)) {
     const newOnes = data.iceSender.slice(appliedSenderIceCount);
     appliedSenderIceCount = data.iceSender.length;
     for (const c of newOnes) {
-      if (!remoteDescSet) pendingIceCandidates.push(c);
-      else {
-        try {
-          await pc.addIceCandidate(new RTCIceCandidate(c));
-          log('Применён ICE от sender');
-        } catch (e) { console.warn('[ICE add]', e); }
+      if (pc.remoteDescription) {
+        try { await pc.addIceCandidate(new RTCIceCandidate(c)); } catch (e) {}
       }
     }
   }
 
-  // ICE от receiver — применяет sender
+  // ICE от Receiver -> Применяет Sender
   if (role === 'sender' && Array.isArray(data.iceReceiver)) {
     const newOnes = data.iceReceiver.slice(appliedReceiverIceCount);
     appliedReceiverIceCount = data.iceReceiver.length;
     for (const c of newOnes) {
-      if (!remoteDescSet) pendingIceCandidates.push(c);
-      else {
-        try {
-          await pc.addIceCandidate(new RTCIceCandidate(c));
-          log('Применён ICE от receiver');
-        } catch (e) { console.warn('[ICE add]', e); }
+      if (pc.remoteDescription) {
+        try { await pc.addIceCandidate(new RTCIceCandidate(c)); } catch (e) {}
       }
     }
   }
 }
 
-async function flushPendingIce() {
-  if (pendingIceCandidates.length === 0) return;
-  log('Применяю отложенные ICE:', pendingIceCandidates.length);
-  const queue = pendingIceCandidates;
-  pendingIceCandidates = [];
-  for (const c of queue) {
-    try {
-      await pc.addIceCandidate(new RTCIceCandidate(c));
-    } catch (e) {
-      console.warn('[ICE add flushed]', e);
-    }
-  }
-}
-
-// ============================================
-// SENDER
-// ============================================
 async function startAsSender() {
   role = 'sender';
-  log('=== Режим отправителя ===');
-
   roomId = await createRoom();
-  log('Комната создана:', roomId);
 
   const url = new URL(location.href);
   url.searchParams.set('r', roomId);
@@ -575,28 +499,20 @@ async function startAsSender() {
   renderWaitFilesList();
   showScreen('wait');
 
-  unsubRoom = listenRoom(roomId, handleRoomUpdate);
-  log('Подписка на комнату');
-
   createPeerConnection();
 
-  log('Создаю offer');
   const offer = await pc.createOffer();
   await pc.setLocalDescription(offer);
 
-  log('Отправляю offer');
+  await waitForIceGathering(pc);
   await setOffer(roomId, pc.localDescription.sdp);
 
-  log('Жду answer...');
+  unsubRoom = listenRoom(roomId, handleRoomUpdate);
 }
 
-// ============================================
-// RECEIVER
-// ============================================
 async function startAsReceiver(roomIdFromUrl) {
   role = 'receiver';
   roomId = roomIdFromUrl;
-  log('=== Режим получателя, комната:', roomId, '===');
 
   const ok = await joinRoom(roomId);
   if (!ok) {
@@ -605,15 +521,13 @@ async function startAsReceiver(roomIdFromUrl) {
   }
 
   showScreen('receive');
-  log('Жду offer от отправителя...');
-
   createPeerConnection();
 
   unsubRoom = listenRoom(roomId, handleRoomUpdate);
 }
 
 // ============================================
-// UI: выбор файлов
+// UI Events
 // ============================================
 dropzone.addEventListener('click', () => fileInput.click());
 
@@ -646,9 +560,6 @@ function addFiles(files) {
   renderFilesList();
 }
 
-// ============================================
-// UI: кнопки
-// ============================================
 createLinkBtn.addEventListener('click', async () => {
   if (selectedFiles.length === 0) return;
   createLinkBtn.disabled = true;
@@ -690,9 +601,6 @@ errorBackBtn.addEventListener('click', () => {
   location.href = location.pathname;
 });
 
-// ============================================
-// СТАРТ
-// ============================================
 (async function init() {
   const urlRoom = getRoomFromUrl();
   if (urlRoom) {
