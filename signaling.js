@@ -1,13 +1,11 @@
 // ============================================
 // signaling.js — сигналинг через Firestore
-// Структура:
-//   rooms/{roomId}            — документ комнаты
-//   rooms/{roomId}/signals/*  — SDP/ICE-сигналы
+// Всё в одном документе: rooms/{roomId}
 // ============================================
 import { initializeApp } from "https://www.gstatic.com/firebasejs/10.8.1/firebase-app.js";
 import {
-  getFirestore, doc, setDoc, getDoc, onSnapshot, deleteDoc,
-  collection, addDoc, getDocs
+  getFirestore, doc, setDoc, getDoc, onSnapshot,
+  deleteDoc, updateDoc, arrayUnion
 } from "https://www.gstatic.com/firebasejs/10.8.1/firebase-firestore.js";
 
 const firebaseConfig = {
@@ -24,91 +22,101 @@ const app = initializeApp(firebaseConfig);
 const db = getFirestore(app);
 
 // ============================================
-// Комнаты
+// Утилиты
 // ============================================
 export function getRoomFromUrl() {
   return new URLSearchParams(location.search).get('r');
 }
 
+function roomRef(roomId) {
+  return doc(db, 'rooms', roomId);
+}
+
+// ============================================
+// Создание / вход
+// ============================================
 export async function createRoom() {
   const roomId = Math.random().toString(36).slice(2, 10);
-  await setDoc(doc(db, 'rooms', roomId), {
+  await setDoc(roomRef(roomId), {
     createdAt: Date.now(),
-    sender: true,
-    receiver: false
+    offer: null,
+    answer: null,
+    iceSender: [],
+    iceReceiver: [],
+    senderDone: false,
+    receiverDone: false
   });
   return roomId;
 }
 
 export async function joinRoom(roomId) {
-  const snap = await getDoc(doc(db, 'rooms', roomId));
+  const snap = await getDoc(roomRef(roomId));
   if (!snap.exists()) return false;
   const data = snap.data();
-  // TTL: 1 час
   if (Date.now() - data.createdAt > 60 * 60 * 1000) return false;
-  await setDoc(doc(db, 'rooms', roomId), { receiver: true }, { merge: true });
   return true;
 }
 
-/**
- * Полная очистка комнаты:
- * 1. Удаляем все документы из подколлекции signals
- * 2. Удаляем сам документ комнаты
- */
-export async function cleanupRoom(roomId) {
-  if (!roomId) return;
-  try {
-    const signalsRef = collection(db, 'rooms', roomId, 'signals');
-    const snap = await getDocs(signalsRef);
-    const deletes = [];
-    snap.forEach(d => deletes.push(deleteDoc(d.ref)));
-    await Promise.all(deletes);
-
-    await deleteDoc(doc(db, 'rooms', roomId));
-    console.log('[CLEANUP] room + signals deleted:', roomId);
-  } catch (e) {
-    console.warn('[CLEANUP]', e);
-  }
-}
-
 // ============================================
-// Сигналы
+// Sender пишет
 // ============================================
-export async function sendSignal(roomId, fromRole, data) {
-  await addDoc(collection(db, 'rooms', roomId, 'signals'), {
-    from: fromRole,
-    ts: Date.now(),
-    ...data
+export async function setOffer(roomId, sdp) {
+  await updateDoc(roomRef(roomId), {
+    offer: { type: 'offer', sdp }
   });
 }
 
-/**
- * Слушает сигналы, адресованные myRole.
- * НЕ удаляет сигналы сразу — они удаляются только в cleanupRoom().
- * Это защищает от гонок: если вторая сторона ещё не подписалась, она увидит все сигналы при подписке.
- */
-export function listenForSignal(roomId, myRole, handler) {
-  const ref = collection(db, 'rooms', roomId, 'signals');
-  const processed = new Set();
+export async function addSenderIce(roomId, candidate) {
+  await updateDoc(roomRef(roomId), {
+    iceSender: arrayUnion(candidate)
+  });
+}
 
-  const unsub = onSnapshot(ref,
-    (snapshot) => {
-      snapshot.docChanges().forEach((change) => {
-        if (change.type !== 'added') return;
-        const data = change.doc.data();
-        const id = change.doc.id;
+export async function markSenderDone(roomId) {
+  await updateDoc(roomRef(roomId), { senderDone: true });
+}
 
-        if (data.from === myRole) return;
-        if (processed.has(id)) return;
-        processed.add(id);
+// ============================================
+// Receiver пишет
+// ============================================
+export async function setAnswer(roomId, sdp) {
+  await updateDoc(roomRef(roomId), {
+    answer: { type: 'answer', sdp }
+  });
+}
 
-        handler(data);
-      });
+export async function addReceiverIce(roomId, candidate) {
+  await updateDoc(roomRef(roomId), {
+    iceReceiver: arrayUnion(candidate)
+  });
+}
+
+export async function markReceiverDone(roomId) {
+  await updateDoc(roomRef(roomId), { receiverDone: true });
+}
+
+// ============================================
+// Слушаем комнату
+// ============================================
+export function listenRoom(roomId, handler) {
+  return onSnapshot(roomRef(roomId),
+    (snap) => {
+      if (!snap.exists()) return;
+      handler(snap.data());
     },
-    (err) => {
-      console.error('[SIGNAL LISTEN ERROR]', err);
-    }
+    (err) => console.error('[ROOM LISTEN ERROR]', err)
   );
+}
 
-  return unsub;
+// ============================================
+// Очистка
+// ============================================
+export async function cleanupRoom(roomId) {
+  if (!roomId) return;
+  try {
+    await deleteDoc(roomRef(roomId));
+    console.log('[CLEANUP] room deleted:', roomId);
+  } catch (e) {
+    console.warn('[CLEANUP]', e);
+  }
 }

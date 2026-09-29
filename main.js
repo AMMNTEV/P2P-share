@@ -1,15 +1,18 @@
 // ============================================
 // main.js — P2P передача файлов через WebRTC
-// Мультифайл + очистка Firestore
+// Мультифайл + надёжный сигналинг
 // ============================================
 import {
-  createRoom, joinRoom, listenForSignal,
-  sendSignal, cleanupRoom, getRoomFromUrl
+  createRoom, joinRoom,
+  setOffer, setAnswer,
+  addSenderIce, addReceiverIce,
+  markSenderDone, markReceiverDone,
+  listenRoom, cleanupRoom, getRoomFromUrl
 } from './signaling.js';
 
-const CHUNK_SIZE = 16 * 1024;         // 16 KB
-const BUFFER_THRESHOLD = 1024 * 1024; // 1 MB
-const BUFFER_LOW = 256 * 1024;        // 256 KB
+const CHUNK_SIZE = 16 * 1024;
+const BUFFER_THRESHOLD = 1024 * 1024;
+const BUFFER_LOW = 256 * 1024;
 
 const RTC_CONFIG = {
   iceServers: [
@@ -23,17 +26,21 @@ let pc = null;
 let dataChannel = null;
 let selectedFiles = [];
 let roomId = null;
-let role = null;                       // 'sender' | 'receiver'
-let receivedFiles = [];                // [{name, mime, size, blob}]
+let role = null;
+let unsubRoom = null;
+
+let receivedFiles = [];
 let currentRecvFile = null;
 let currentRecvChunks = [];
 let currentRecvBytes = 0;
 
-// Очередь ICE-кандидатов до установки remote description
-let pendingIceCandidates = [];
+let appliedOffer = false;
+let appliedAnswer = false;
+let appliedSenderIceCount = 0;
+let appliedReceiverIceCount = 0;
 let remoteDescSet = false;
+let pendingIceCandidates = [];
 
-// Флаг, чтобы не запускать sendAllFiles дважды
 let sendingStarted = false;
 
 // --- DOM ---
@@ -203,19 +210,24 @@ function downloadBlob(blob, name) {
 }
 
 // ============================================
-// WebRTC: PeerConnection
+// WebRTC
 // ============================================
 function createPeerConnection() {
   log('Создаю RTCPeerConnection');
   pc = new RTCPeerConnection(RTC_CONFIG);
 
-  pc.onicecandidate = (event) => {
+  pc.onicecandidate = async (event) => {
     if (event.candidate && roomId) {
       log('Отправляю ICE-кандидат');
-      sendSignal(roomId, role, {
-        type: 'ice',
-        candidate: event.candidate.toJSON()
-      }).catch(e => console.warn('[ICE send]', e));
+      try {
+        if (role === 'sender') {
+          await addSenderIce(roomId, event.candidate.toJSON());
+        } else {
+          await addReceiverIce(roomId, event.candidate.toJSON());
+        }
+      } catch (e) {
+        console.warn('[ICE send]', e);
+      }
     } else if (!event.candidate) {
       log('ICE gathering завершён');
     }
@@ -237,7 +249,6 @@ function createPeerConnection() {
     }
   };
 
-  // DataChannel: sender создаёт, receiver получает
   if (role === 'sender') {
     log('Создаю DataChannel');
     dataChannel = pc.createDataChannel('file', { ordered: true });
@@ -282,7 +293,6 @@ function setupDataChannel() {
     dataChannel.onmessage = (event) => {
       const data = event.data;
 
-      // Управляющее сообщение (строка)
       if (typeof data === 'string') {
         let msg;
         try { msg = JSON.parse(data); } catch { return; }
@@ -328,7 +338,6 @@ function setupDataChannel() {
         return;
       }
 
-      // Бинарный чанк
       if (currentRecvFile) {
         currentRecvChunks.push(data);
         currentRecvBytes += data.byteLength;
@@ -345,7 +354,7 @@ function setupDataChannel() {
 }
 
 // ============================================
-// Отправитель: отправка
+// Отправитель: отправка файлов по порядку
 // ============================================
 async function sendAllFiles() {
   try {
@@ -361,14 +370,8 @@ async function sendAllFiles() {
     waitStatus.textContent = 'Все файлы отправлены ✓';
     waitStatus.className = 'status ok';
 
-    // Дадим время получателю получить все чанки перед очисткой Firestore
-    setTimeout(async () => {
-      if (roomId) {
-        log('Очищаю Firestore');
-        await cleanupRoom(roomId);
-        roomId = null;
-      }
-    }, 3000);
+    if (roomId) await markSenderDone(roomId);
+    scheduleCleanup();
   } catch (e) {
     console.error('[SEND]', e);
     waitStatus.textContent = 'Ошибка отправки';
@@ -389,7 +392,6 @@ async function sendOneFile(file, index) {
   let sentBytes = 0;
 
   while (offset < file.size) {
-    // Backpressure
     if (dataChannel.bufferedAmount > BUFFER_THRESHOLD) {
       await new Promise(resolve => {
         const check = () => {
@@ -433,14 +435,8 @@ async function onAllReceived() {
   recvProgressText.textContent = '100%';
   downloadAllBtn.style.display = 'block';
 
-  // Получатель тоже чистит комнату (отправитель мог успеть)
-  setTimeout(async () => {
-    if (roomId) {
-      log('Очищаю Firestore (receiver)');
-      await cleanupRoom(roomId);
-      roomId = null;
-    }
-  }, 3000);
+  if (roomId) await markReceiverDone(roomId);
+  scheduleCleanup();
 }
 
 downloadAllBtn.addEventListener('click', () => {
@@ -450,20 +446,36 @@ downloadAllBtn.addEventListener('click', () => {
 });
 
 // ============================================
-// Обработка сигналов
+// Очистка: отложенная, через 10 сек
 // ============================================
-async function handleSignal(data) {
+let cleanupScheduled = false;
+function scheduleCleanup() {
+  if (cleanupScheduled) return;
+  cleanupScheduled = true;
+  setTimeout(async () => {
+    if (roomId) {
+      log('Очищаю Firestore');
+      await cleanupRoom(roomId);
+      roomId = null;
+    }
+  }, 10000);
+}
+
+// ============================================
+// Обработка изменений комнаты
+// ============================================
+async function handleRoomUpdate(data) {
   if (!pc) {
-    log('PC не создан, игнорирую сигнал', data.type);
+    log('PC не создан, игнорирую обновление');
     return;
   }
 
-  try {
-    if (data.type === 'offer') {
-      log('Получен offer');
-      await pc.setRemoteDescription(new RTCSessionDescription({
-        type: 'offer', sdp: data.sdp
-      }));
+  // OFFER (только для получателя)
+  if (role === 'receiver' && data.offer && !appliedOffer) {
+    log('Получен offer');
+    appliedOffer = true;
+    try {
+      await pc.setRemoteDescription(new RTCSessionDescription(data.offer));
       remoteDescSet = true;
       await flushPendingIce();
 
@@ -471,36 +483,53 @@ async function handleSignal(data) {
       await pc.setLocalDescription(answer);
 
       log('Отправляю answer');
-      await sendSignal(roomId, role, {
-        type: 'answer',
-        sdp: pc.localDescription.sdp
-      });
+      await setAnswer(roomId, pc.localDescription.sdp);
+    } catch (e) {
+      console.error('[handle offer]', e);
     }
+  }
 
-    else if (data.type === 'answer') {
-      log('Получен answer');
-      await pc.setRemoteDescription(new RTCSessionDescription({
-        type: 'answer', sdp: data.sdp
-      }));
+  // ANSWER (только для отправителя)
+  if (role === 'sender' && data.answer && !appliedAnswer) {
+    log('Получен answer');
+    appliedAnswer = true;
+    try {
+      await pc.setRemoteDescription(new RTCSessionDescription(data.answer));
       remoteDescSet = true;
       await flushPendingIce();
+    } catch (e) {
+      console.error('[handle answer]', e);
     }
+  }
 
-    else if (data.type === 'ice') {
-      if (!remoteDescSet) {
-        log('ICE до remote description — в очередь');
-        pendingIceCandidates.push(data.candidate);
-        return;
-      }
-      log('Добавляю ICE-кандидат');
-      try {
-        await pc.addIceCandidate(new RTCIceCandidate(data.candidate));
-      } catch (e) {
-        console.warn('[ICE add]', e);
+  // ICE от sender — применяет receiver
+  if (role === 'receiver' && Array.isArray(data.iceSender)) {
+    const newOnes = data.iceSender.slice(appliedSenderIceCount);
+    appliedSenderIceCount = data.iceSender.length;
+    for (const c of newOnes) {
+      if (!remoteDescSet) pendingIceCandidates.push(c);
+      else {
+        try {
+          await pc.addIceCandidate(new RTCIceCandidate(c));
+          log('Применён ICE от sender');
+        } catch (e) { console.warn('[ICE add]', e); }
       }
     }
-  } catch (e) {
-    console.error('[SIGNAL]', e);
+  }
+
+  // ICE от receiver — применяет sender
+  if (role === 'sender' && Array.isArray(data.iceReceiver)) {
+    const newOnes = data.iceReceiver.slice(appliedReceiverIceCount);
+    appliedReceiverIceCount = data.iceReceiver.length;
+    for (const c of newOnes) {
+      if (!remoteDescSet) pendingIceCandidates.push(c);
+      else {
+        try {
+          await pc.addIceCandidate(new RTCIceCandidate(c));
+          log('Применён ICE от receiver');
+        } catch (e) { console.warn('[ICE add]', e); }
+      }
+    }
   }
 }
 
@@ -525,7 +554,6 @@ async function startAsSender() {
   role = 'sender';
   log('=== Режим отправителя ===');
 
-  // 1. Создать комнату
   roomId = await createRoom();
   log('Комната создана:', roomId);
 
@@ -536,26 +564,19 @@ async function startAsSender() {
   renderWaitFilesList();
   showScreen('wait');
 
-  // 2. Подписка на сигналы — ДО отправки оффера
-  log('Подписка на сигналы');
-  listenForSignal(roomId, 'sender', handleSignal);
+  unsubRoom = listenRoom(roomId, handleRoomUpdate);
+  log('Подписка на комнату');
 
-  // 3. Создать PC
   createPeerConnection();
 
-  // 4. Создать оффер
   log('Создаю offer');
   const offer = await pc.createOffer();
   await pc.setLocalDescription(offer);
 
-  // 5. Отправить оффер (ICE пойдут отдельно)
   log('Отправляю offer');
-  await sendSignal(roomId, 'sender', {
-    type: 'offer',
-    sdp: pc.localDescription.sdp
-  });
+  await setOffer(roomId, pc.localDescription.sdp);
 
-  log('Жду ответа получателя...');
+  log('Жду answer...');
 }
 
 // ============================================
@@ -566,11 +587,6 @@ async function startAsReceiver(roomIdFromUrl) {
   roomId = roomIdFromUrl;
   log('=== Режим получателя, комната:', roomId, '===');
 
-  // 1. Подписка на сигналы — ДО всего остального
-  log('Подписка на сигналы');
-  listenForSignal(roomId, 'receiver', handleSignal);
-
-  // 2. Проверить, что комната существует
   const ok = await joinRoom(roomId);
   if (!ok) {
     showError('Комната не найдена или ссылка устарела.');
@@ -580,8 +596,9 @@ async function startAsReceiver(roomIdFromUrl) {
   showScreen('receive');
   log('Жду offer от отправителя...');
 
-  // 3. Создать PC (DataChannel появится сам через ondatachannel)
   createPeerConnection();
+
+  unsubRoom = listenRoom(roomId, handleRoomUpdate);
 }
 
 // ============================================
@@ -645,12 +662,14 @@ copyLinkBtn.addEventListener('click', async () => {
 });
 
 cancelSendBtn.addEventListener('click', async () => {
+  if (unsubRoom) unsubRoom();
   if (roomId) await cleanupRoom(roomId);
   if (pc) pc.close();
   location.href = location.pathname;
 });
 
 cancelRecvBtn.addEventListener('click', async () => {
+  if (unsubRoom) unsubRoom();
   if (roomId) await cleanupRoom(roomId);
   if (pc) pc.close();
   location.href = location.pathname;
@@ -673,5 +692,6 @@ errorBackBtn.addEventListener('click', () => {
 })();
 
 window.addEventListener('beforeunload', () => {
+  if (unsubRoom) unsubRoom();
   if (pc) pc.close();
 });
