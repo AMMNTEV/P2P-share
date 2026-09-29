@@ -7,9 +7,9 @@ import {
   sendSignal, cleanupRoom, getRoomFromUrl
 } from './signaling.js';
 
-const CHUNK_SIZE = 16 * 1024;
-const BUFFER_THRESHOLD = 1024 * 1024;
-const BUFFER_LOW = 256 * 1024;
+const CHUNK_SIZE = 16 * 1024;         // 16 KB
+const BUFFER_THRESHOLD = 1024 * 1024; // 1 MB
+const BUFFER_LOW = 256 * 1024;        // 256 KB
 
 const RTC_CONFIG = {
   iceServers: [
@@ -21,14 +21,20 @@ const RTC_CONFIG = {
 // --- Состояние ---
 let pc = null;
 let dataChannel = null;
-let selectedFiles = [];       // массив File
+let selectedFiles = [];
 let roomId = null;
-let role = null;              // 'sender' | 'receiver'
-let sentAllDone = false;
-let receivedFiles = [];       // [{name, mime, size, blob}]
-let currentRecvFile = null;   // файл в процессе приёма
+let role = null;                       // 'sender' | 'receiver'
+let receivedFiles = [];                // [{name, mime, size, blob}]
+let currentRecvFile = null;
 let currentRecvChunks = [];
 let currentRecvBytes = 0;
+
+// Очередь ICE-кандидатов до установки remote description
+let pendingIceCandidates = [];
+let remoteDescSet = false;
+
+// Флаг, чтобы не запускать sendAllFiles дважды
+let sendingStarted = false;
 
 // --- DOM ---
 const screens = {
@@ -70,6 +76,10 @@ const errorBackBtn = document.getElementById('errorBackBtn');
 // ============================================
 // Утилиты
 // ============================================
+function log(...args) {
+  console.log('[P2P]', ...args);
+}
+
 function showScreen(name) {
   Object.values(screens).forEach(s => s.classList.remove('active'));
   screens[name].classList.add('active');
@@ -83,6 +93,7 @@ function formatSize(bytes) {
 }
 
 function showError(text) {
+  log('ERROR:', text);
   errorText.textContent = text;
   showScreen('error');
 }
@@ -153,7 +164,7 @@ function markWaitFileDone(index) {
 // ============================================
 function renderRecvFilesList() {
   recvFilesList.innerHTML = '';
-  receivedFiles.forEach((f, i) => {
+  receivedFiles.forEach((f) => {
     const item = document.createElement('div');
     item.className = 'file-item done';
     item.innerHTML = `
@@ -192,35 +203,48 @@ function downloadBlob(blob, name) {
 }
 
 // ============================================
-// WebRTC
+// WebRTC: PeerConnection
 // ============================================
 function createPeerConnection() {
+  log('Создаю RTCPeerConnection');
   pc = new RTCPeerConnection(RTC_CONFIG);
 
   pc.onicecandidate = (event) => {
     if (event.candidate && roomId) {
+      log('Отправляю ICE-кандидат');
       sendSignal(roomId, role, {
         type: 'ice',
         candidate: event.candidate.toJSON()
-      });
+      }).catch(e => console.warn('[ICE send]', e));
+    } else if (!event.candidate) {
+      log('ICE gathering завершён');
     }
   };
 
+  pc.oniceconnectionstatechange = () => {
+    log('ICE state:', pc.iceConnectionState);
+  };
+
   pc.onconnectionstatechange = () => {
-    console.log('[PC]', pc.connectionState);
-    if (pc.connectionState === 'failed' || pc.connectionState === 'disconnected') {
+    log('PC state:', pc.connectionState);
+    if (pc.connectionState === 'failed') {
+      waitStatus.textContent = 'Соединение не установлено';
+      waitStatus.className = 'status err';
+    }
+    if (pc.connectionState === 'disconnected') {
       waitStatus.textContent = 'Соединение потеряно';
       waitStatus.className = 'status err';
     }
   };
 
+  // DataChannel: sender создаёт, receiver получает
   if (role === 'sender') {
+    log('Создаю DataChannel');
     dataChannel = pc.createDataChannel('file', { ordered: true });
     setupDataChannel();
-  }
-
-  if (role === 'receiver') {
+  } else {
     pc.ondatachannel = (event) => {
+      log('Получен DataChannel от отправителя');
       dataChannel = event.channel;
       setupDataChannel();
     };
@@ -236,37 +260,35 @@ function setupDataChannel() {
   dataChannel.binaryType = 'arraybuffer';
 
   dataChannel.onopen = () => {
-    console.log('[DC] open');
+    log('DataChannel открыт');
     if (role === 'sender') {
       waitStatus.textContent = 'Соединение установлено, отправка...';
       waitStatus.className = 'status ok';
       sendProgress.style.display = 'flex';
-      sendAllFiles();
+      if (!sendingStarted) {
+        sendingStarted = true;
+        sendAllFiles();
+      }
     } else {
       recvStatus.textContent = 'Соединение установлено, приём...';
       recvStatus.className = 'status ok';
     }
   };
 
-  dataChannel.onclose = () => {
-    console.log('[DC] close');
-  };
-
-  dataChannel.onerror = (e) => {
-    console.error('[DC]', e);
-  };
+  dataChannel.onclose = () => log('DataChannel закрыт');
+  dataChannel.onerror = (e) => console.error('[DC error]', e);
 
   if (role === 'receiver') {
     dataChannel.onmessage = (event) => {
       const data = event.data;
 
-      // Строковое сообщение — управляющее
+      // Управляющее сообщение (строка)
       if (typeof data === 'string') {
         let msg;
         try { msg = JSON.parse(data); } catch { return; }
 
         if (msg.type === 'meta') {
-          // Начало нового файла
+          log('Новый файл:', msg.name, formatSize(msg.size));
           currentRecvFile = msg;
           currentRecvChunks = [];
           currentRecvBytes = 0;
@@ -279,8 +301,8 @@ function setupDataChannel() {
         }
 
         if (msg.type === 'end') {
-          // Завершение текущего файла
           if (currentRecvFile) {
+            log('Файл завершён:', currentRecvFile.name);
             const blob = new Blob(currentRecvChunks, {
               type: currentRecvFile.mime || 'application/octet-stream'
             });
@@ -299,11 +321,10 @@ function setupDataChannel() {
         }
 
         if (msg.type === 'all-done') {
-          // Все файлы получены
+          log('Все файлы получены');
           onAllReceived();
           return;
         }
-
         return;
       }
 
@@ -324,30 +345,38 @@ function setupDataChannel() {
 }
 
 // ============================================
-// Отправитель: отправка всех файлов
+// Отправитель: отправка
 // ============================================
 async function sendAllFiles() {
-  for (let i = 0; i < selectedFiles.length; i++) {
-    const file = selectedFiles[i];
-    await sendOneFile(file, i);
-    markWaitFileDone(i);
-  }
+  try {
+    for (let i = 0; i < selectedFiles.length; i++) {
+      const file = selectedFiles[i];
+      log(`Отправляю файл ${i + 1}/${selectedFiles.length}:`, file.name);
+      await sendOneFile(file, i);
+      markWaitFileDone(i);
+    }
 
-  // Все файлы отправлены
-  dataChannel.send(JSON.stringify({ type: 'all-done' }));
-  waitStatus.textContent = 'Все файлы отправлены ✓';
-  waitStatus.className = 'status ok';
+    log('Все файлы отправлены, шлю all-done');
+    dataChannel.send(JSON.stringify({ type: 'all-done' }));
+    waitStatus.textContent = 'Все файлы отправлены ✓';
+    waitStatus.className = 'status ok';
 
-  // Очищаем Firestore — комната больше не нужна
-  if (roomId) {
-    await cleanupRoom(roomId);
-    roomId = null;
-    console.log('[CLEANUP] Firestore room deleted');
+    // Дадим время получателю получить все чанки перед очисткой Firestore
+    setTimeout(async () => {
+      if (roomId) {
+        log('Очищаю Firestore');
+        await cleanupRoom(roomId);
+        roomId = null;
+      }
+    }, 3000);
+  } catch (e) {
+    console.error('[SEND]', e);
+    waitStatus.textContent = 'Ошибка отправки';
+    waitStatus.className = 'status err';
   }
 }
 
 async function sendOneFile(file, index) {
-  // Метаданные
   dataChannel.send(JSON.stringify({
     type: 'meta',
     name: file.name,
@@ -360,6 +389,7 @@ async function sendOneFile(file, index) {
   let sentBytes = 0;
 
   while (offset < file.size) {
+    // Backpressure
     if (dataChannel.bufferedAmount > BUFFER_THRESHOLD) {
       await new Promise(resolve => {
         const check = () => {
@@ -381,7 +411,6 @@ async function sendOneFile(file, index) {
     sendProgressText.textContent = percent + '%';
   }
 
-  // Конец файла
   dataChannel.send(JSON.stringify({ type: 'end' }));
 }
 
@@ -404,18 +433,18 @@ async function onAllReceived() {
   recvProgressText.textContent = '100%';
   downloadAllBtn.style.display = 'block';
 
-  // Очищаем Firestore — комната больше не нужна
-  if (roomId) {
-    await cleanupRoom(roomId);
-    roomId = null;
-    console.log('[CLEANUP] Firestore room deleted');
-  }
+  // Получатель тоже чистит комнату (отправитель мог успеть)
+  setTimeout(async () => {
+    if (roomId) {
+      log('Очищаю Firestore (receiver)');
+      await cleanupRoom(roomId);
+      roomId = null;
+    }
+  }, 3000);
 }
 
-// Кнопка «Скачать все»
 downloadAllBtn.addEventListener('click', () => {
   receivedFiles.forEach((f, i) => {
-    // Небольшая задержка, чтобы браузер не блокировал множественные скачивания
     setTimeout(() => downloadBlob(f.blob, f.name), i * 300);
   });
 });
@@ -424,30 +453,68 @@ downloadAllBtn.addEventListener('click', () => {
 // Обработка сигналов
 // ============================================
 async function handleSignal(data) {
-  if (!pc) return;
+  if (!pc) {
+    log('PC не создан, игнорирую сигнал', data.type);
+    return;
+  }
 
   try {
     if (data.type === 'offer') {
+      log('Получен offer');
       await pc.setRemoteDescription(new RTCSessionDescription({
         type: 'offer', sdp: data.sdp
       }));
+      remoteDescSet = true;
+      await flushPendingIce();
+
       const answer = await pc.createAnswer();
       await pc.setLocalDescription(answer);
-      sendSignal(roomId, role, {
+
+      log('Отправляю answer');
+      await sendSignal(roomId, role, {
         type: 'answer',
         sdp: pc.localDescription.sdp
       });
     }
+
     else if (data.type === 'answer') {
+      log('Получен answer');
       await pc.setRemoteDescription(new RTCSessionDescription({
         type: 'answer', sdp: data.sdp
       }));
+      remoteDescSet = true;
+      await flushPendingIce();
     }
+
     else if (data.type === 'ice') {
-      await pc.addIceCandidate(new RTCIceCandidate(data.candidate));
+      if (!remoteDescSet) {
+        log('ICE до remote description — в очередь');
+        pendingIceCandidates.push(data.candidate);
+        return;
+      }
+      log('Добавляю ICE-кандидат');
+      try {
+        await pc.addIceCandidate(new RTCIceCandidate(data.candidate));
+      } catch (e) {
+        console.warn('[ICE add]', e);
+      }
     }
   } catch (e) {
     console.error('[SIGNAL]', e);
+  }
+}
+
+async function flushPendingIce() {
+  if (pendingIceCandidates.length === 0) return;
+  log('Применяю отложенные ICE:', pendingIceCandidates.length);
+  const queue = pendingIceCandidates;
+  pendingIceCandidates = [];
+  for (const c of queue) {
+    try {
+      await pc.addIceCandidate(new RTCIceCandidate(c));
+    } catch (e) {
+      console.warn('[ICE add flushed]', e);
+    }
   }
 }
 
@@ -456,7 +523,11 @@ async function handleSignal(data) {
 // ============================================
 async function startAsSender() {
   role = 'sender';
+  log('=== Режим отправителя ===');
+
+  // 1. Создать комнату
   roomId = await createRoom();
+  log('Комната создана:', roomId);
 
   const url = new URL(location.href);
   url.searchParams.set('r', roomId);
@@ -465,32 +536,26 @@ async function startAsSender() {
   renderWaitFilesList();
   showScreen('wait');
 
+  // 2. Подписка на сигналы — ДО отправки оффера
+  log('Подписка на сигналы');
+  listenForSignal(roomId, 'sender', handleSignal);
+
+  // 3. Создать PC
   createPeerConnection();
 
+  // 4. Создать оффер
+  log('Создаю offer');
   const offer = await pc.createOffer();
   await pc.setLocalDescription(offer);
-  await waitForIce(pc);
 
+  // 5. Отправить оффер (ICE пойдут отдельно)
+  log('Отправляю offer');
   await sendSignal(roomId, 'sender', {
     type: 'offer',
     sdp: pc.localDescription.sdp
   });
 
-  listenForSignal(roomId, 'sender', handleSignal);
-}
-
-function waitForIce(pc) {
-  return new Promise((resolve) => {
-    if (pc.iceGatheringState === 'complete') return resolve();
-    const check = () => {
-      if (pc.iceGatheringState === 'complete') {
-        pc.removeEventListener('icegatheringstatechange', check);
-        resolve();
-      }
-    };
-    pc.addEventListener('icegatheringstatechange', check);
-    setTimeout(resolve, 3000);
-  });
+  log('Жду ответа получателя...');
 }
 
 // ============================================
@@ -499,7 +564,13 @@ function waitForIce(pc) {
 async function startAsReceiver(roomIdFromUrl) {
   role = 'receiver';
   roomId = roomIdFromUrl;
+  log('=== Режим получателя, комната:', roomId, '===');
 
+  // 1. Подписка на сигналы — ДО всего остального
+  log('Подписка на сигналы');
+  listenForSignal(roomId, 'receiver', handleSignal);
+
+  // 2. Проверить, что комната существует
   const ok = await joinRoom(roomId);
   if (!ok) {
     showError('Комната не найдена или ссылка устарела.');
@@ -507,12 +578,10 @@ async function startAsReceiver(roomIdFromUrl) {
   }
 
   showScreen('receive');
-  createPeerConnection();
+  log('Жду offer от отправителя...');
 
-  listenForSignal(roomId, 'receiver', async (data) => {
-    if (data.type === 'offer') await handleSignal(data);
-    else if (data.type === 'ice') await handleSignal(data);
-  });
+  // 3. Создать PC (DataChannel появится сам через ondatachannel)
+  createPeerConnection();
 }
 
 // ============================================
@@ -550,7 +619,7 @@ function addFiles(files) {
 }
 
 // ============================================
-// UI: создать ссылку
+// UI: кнопки
 // ============================================
 createLinkBtn.addEventListener('click', async () => {
   if (selectedFiles.length === 0) return;
@@ -564,9 +633,6 @@ createLinkBtn.addEventListener('click', async () => {
   }
 });
 
-// ============================================
-// UI: копировать ссылку
-// ============================================
 copyLinkBtn.addEventListener('click', async () => {
   linkInput.select();
   try {
@@ -578,9 +644,6 @@ copyLinkBtn.addEventListener('click', async () => {
   }
 });
 
-// ============================================
-// UI: отмена
-// ============================================
 cancelSendBtn.addEventListener('click', async () => {
   if (roomId) await cleanupRoom(roomId);
   if (pc) pc.close();

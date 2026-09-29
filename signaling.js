@@ -7,7 +7,7 @@
 import { initializeApp } from "https://www.gstatic.com/firebasejs/10.8.1/firebase-app.js";
 import {
   getFirestore, doc, setDoc, getDoc, onSnapshot, deleteDoc,
-  collection, addDoc, query, orderBy, getDocs
+  collection, addDoc, getDocs
 } from "https://www.gstatic.com/firebasejs/10.8.1/firebase-firestore.js";
 
 const firebaseConfig = {
@@ -58,14 +58,12 @@ export async function joinRoom(roomId) {
 export async function cleanupRoom(roomId) {
   if (!roomId) return;
   try {
-    // 1. Удаляем все сигналы
     const signalsRef = collection(db, 'rooms', roomId, 'signals');
     const snap = await getDocs(signalsRef);
     const deletes = [];
     snap.forEach(d => deletes.push(deleteDoc(d.ref)));
     await Promise.all(deletes);
 
-    // 2. Удаляем саму комнату
     await deleteDoc(doc(db, 'rooms', roomId));
     console.log('[CLEANUP] room + signals deleted:', roomId);
   } catch (e) {
@@ -84,27 +82,33 @@ export async function sendSignal(roomId, fromRole, data) {
   });
 }
 
+/**
+ * Слушает сигналы, адресованные myRole.
+ * НЕ удаляет сигналы сразу — они удаляются только в cleanupRoom().
+ * Это защищает от гонок: если вторая сторона ещё не подписалась, она увидит все сигналы при подписке.
+ */
 export function listenForSignal(roomId, myRole, handler) {
   const ref = collection(db, 'rooms', roomId, 'signals');
-  const q = query(ref, orderBy('ts', 'asc'));
+  const processed = new Set();
 
-  const seen = new Set();
+  const unsub = onSnapshot(ref,
+    (snapshot) => {
+      snapshot.docChanges().forEach((change) => {
+        if (change.type !== 'added') return;
+        const data = change.doc.data();
+        const id = change.doc.id;
 
-  return onSnapshot(q, (snapshot) => {
-    snapshot.docChanges().forEach(async (change) => {
-      if (change.type !== 'added') return;
+        if (data.from === myRole) return;
+        if (processed.has(id)) return;
+        processed.add(id);
 
-      const data = change.doc.data();
-      const id = change.doc.id;
+        handler(data);
+      });
+    },
+    (err) => {
+      console.error('[SIGNAL LISTEN ERROR]', err);
+    }
+  );
 
-      if (data.from === myRole) return;
-      if (seen.has(id)) return;
-      seen.add(id);
-
-      // Удаляем сигнал сразу после обработки
-      deleteDoc(doc(db, 'rooms', roomId, 'signals', id)).catch(() => {});
-
-      handler(data);
-    });
-  });
+  return unsub;
 }
