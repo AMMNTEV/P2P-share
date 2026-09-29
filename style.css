@@ -1,0 +1,229 @@
+* { box-sizing: border-box; }
+
+html, body {
+  min-height: 100%;
+  margin: 0;
+  background: #000;
+  color: #d0d0d0;
+  font-family: 'Courier New', Courier, monospace;
+  letter-spacing: 0.3px;
+}
+
+body {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 20px;
+}
+
+.app {
+  width: 100%;
+  max-width: 520px;
+}
+
+.screen {
+  display: none;
+  flex-direction: column;
+  gap: 14px;
+  background: rgba(10, 10, 10, 0.92);
+  border: 1px solid #2a2a2a;
+  padding: 24px;
+  backdrop-filter: blur(4px);
+}
+
+.screen.active {
+  display: flex;
+}
+
+h1 {
+  color: #6f6;
+  font-size: 16px;
+  margin: 0;
+  text-transform: uppercase;
+  letter-spacing: 2px;
+}
+
+h1::before { content: '[ '; color: #444; }
+h1::after  { content: ' ]'; color: #444; }
+
+.subtitle {
+  color: #666;
+  font-size: 12px;
+  line-height: 1.5;
+  margin: 0;
+}
+
+/* Дроп-зона */
+.dropzone {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 10px;
+  padding: 32px 16px;
+  border: 1px dashed #2a2a2a;
+  background: #050505;
+  cursor: pointer;
+  transition: all 0.15s;
+  text-align: center;
+}
+
+.dropzone:hover,
+.dropzone.dragover {
+  border-color: #6f6;
+  background: #0a1a0a;
+}
+
+.dropzone-icon {
+  font-size: 32px;
+  color: #6f6;
+  line-height: 1;
+}
+
+.dropzone-text {
+  font-size: 13px;
+  color: #d0d0d0;
+}
+
+.dropzone-text strong {
+  color: #6f6;
+}
+
+.dropzone-hint {
+  font-size: 10px;
+  color: #555;
+  margin-top: 4px;
+}
+
+/* Информация о файле */
+.file-info {
+  background: #050505;
+  border: 1px solid #2a2a2a;
+  padding: 10px 12px;
+}
+
+.file-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  font-size: 12px;
+}
+
+.file-name {
+  color: #d0d0d0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  flex: 1;
+}
+
+.file-size {
+  color: #666;
+  flex-shrink: 0;
+}
+
+/* Ссылка */
+.link-box {
+  display: flex;
+  gap: 6px;
+}
+
+.link-box input {
+  flex: 1;
+  padding: 8px;
+  background: #050505;
+  border: 1px solid #2a2a2a;
+  color: #d0d0d0;
+  font-family: inherit;
+  font-size: 11px;
+  outline: none;
+  min-width: 0;
+}
+
+.link-box input:focus { border-color: #6f6; }
+
+/* Кнопки */
+.btn {
+  padding: 10px 16px;
+  background: transparent;
+  border: 1px solid #2a4a2a;
+  color: #6f6;
+  font-size: 12px;
+  font-weight: bold;
+  font-family: inherit;
+  cursor: pointer;
+  text-transform: uppercase;
+  letter-spacing: 1px;
+  transition: all 0.15s;
+}
+
+.btn:hover:not(:disabled) {
+  background: #0a1a0a;
+  border-color: #6f6;
+}
+
+.btn:disabled {
+  color: #333;
+  border-color: #1a1a1a;
+  cursor: not-allowed;
+}
+
+.btn.primary {
+  color: #6f6;
+  border-color: #2a4a2a;
+}
+
+.btn.secondary {
+  color: #888;
+  border-color: #2a2a2a;
+  font-weight: normal;
+  text-transform: none;
+  letter-spacing: 0.3px;
+}
+
+.btn.secondary:hover {
+  background: #111;
+  color: #fff;
+  border-color: #555;
+}
+
+.btn.small {
+  padding: 8px 12px;
+  font-size: 10px;
+}
+
+/* Статус */
+.status {
+  font-size: 11px;
+  color: #888;
+  padding: 6px 0;
+}
+
+.status.ok { color: #6f6; }
+.status.err { color: #f66; }
+
+/* Прогресс */
+.progress {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.progress-bar {
+  height: 6px;
+  background: #050505;
+  border: 1px solid #2a2a2a;
+  overflow: hidden;
+}
+
+.progress-fill {
+  height: 100%;
+  background: #6f6;
+  width: 0%;
+  transition: width 0.15s ease;
+}
+
+.progress-text {
+  font-size: 11px;
+  color: #888;
+  text-align: right;
+}

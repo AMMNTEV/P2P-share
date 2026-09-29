@@ -1,0 +1,98 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+  <title>P2P Share — передача файлов по ссылке</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<div class="app">
+
+  <!-- Экран 1: выбор файла -->
+  <section class="screen active" id="screen-send">
+    <h1>P2P Share</h1>
+    <p class="subtitle">Передача файлов напрямую между браузерами.<br>Без регистрации. Без загрузки на сервер.</p>
+
+    <label class="dropzone" id="dropzone">
+      <input type="file" id="fileInput" hidden>
+      <div class="dropzone-icon">⬆</div>
+      <div class="dropzone-text">
+        <strong>Выберите файл</strong> или перетащите сюда
+      </div>
+      <div class="dropzone-hint">Любой размер. Файл никуда не загружается, пока не откроют ссылку.</div>
+    </label>
+
+    <div class="file-info" id="fileInfo" style="display:none;">
+      <div class="file-row">
+        <span class="file-name" id="fileName"></span>
+        <span class="file-size" id="fileSize"></span>
+      </div>
+    </div>
+
+    <button class="btn primary" id="createLinkBtn" disabled>Создать ссылку</button>
+  </section>
+
+  <!-- Экран 2: ожидание получателя -->
+  <section class="screen" id="screen-wait">
+    <h1>Ссылка готова</h1>
+    <p class="subtitle">Отправьте её получателю любым способом.</p>
+
+    <div class="link-box">
+      <input type="text" id="linkInput" readonly>
+      <button class="btn small" id="copyLinkBtn">Копировать</button>
+    </div>
+
+    <div class="file-info">
+      <div class="file-row">
+        <span class="file-name" id="waitFileName"></span>
+        <span class="file-size" id="waitFileSize"></span>
+      </div>
+    </div>
+
+    <div class="status" id="waitStatus">Ожидание получателя...</div>
+
+    <div class="progress" id="sendProgress" style="display:none;">
+      <div class="progress-bar"><div class="progress-fill" id="sendProgressFill"></div></div>
+      <div class="progress-text" id="sendProgressText">0%</div>
+    </div>
+
+    <button class="btn secondary" id="cancelSendBtn">Отменить</button>
+  </section>
+
+  <!-- Экран 3: получение файла -->
+  <section class="screen" id="screen-receive">
+    <h1>Получение файла</h1>
+    <p class="subtitle" id="recvSubtitle">Подключение к отправителю...</p>
+
+    <div class="status" id="recvStatus">Установка соединения...</div>
+
+    <div class="file-info" id="recvFileInfo" style="display:none;">
+      <div class="file-row">
+        <span class="file-name" id="recvFileName"></span>
+        <span class="file-size" id="recvFileSize"></span>
+      </div>
+    </div>
+
+    <div class="progress" id="recvProgress" style="display:none;">
+      <div class="progress-bar"><div class="progress-fill" id="recvProgressFill"></div></div>
+      <div class="progress-text" id="recvProgressText">0%</div>
+    </div>
+
+    <button class="btn primary" id="downloadBtn" style="display:none;">Скачать файл</button>
+    <button class="btn secondary" id="cancelRecvBtn">Отменить</button>
+  </section>
+
+  <!-- Экран 4: ошибка -->
+  <section class="screen" id="screen-error">
+    <h1>Ошибка</h1>
+    <p class="subtitle" id="errorText">—</p>
+    <button class="btn secondary" id="errorBackBtn">На главную</button>
+  </section>
+
+</div>
+
+<script type="module" src="main.js"></script>
+</body>
+</html>
