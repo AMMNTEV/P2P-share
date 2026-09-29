@@ -1,6 +1,6 @@
 // ============================================
 // main.js — P2P передача файлов через WebRTC
-// Мультифайл + Публичный TURN + Исправленный сигналинг
+// Исправленная обработка ICE Буфера + Публичные TURN
 // ============================================
 import {
   createRoom, joinRoom,
@@ -14,11 +14,12 @@ const CHUNK_SIZE = 16 * 1024;
 const BUFFER_THRESHOLD = 1024 * 1024;
 const BUFFER_LOW = 256 * 1024;
 
-// STUN + Бесплатный публичный TURN без регистрации от Open Relay
+// Набор публичных STUN/TURN серверов с фоллбэками
 const RTC_CONFIG = {
   iceServers: [
     { urls: 'stun:stun.l.google.com:19302' },
     { urls: 'stun:stun1.l.google.com:19302' },
+    { urls: 'stun:stun2.l.google.com:19302' },
     {
       urls: [
         'turn:openrelay.metered.ca:80',
@@ -28,7 +29,8 @@ const RTC_CONFIG = {
       username: 'openrelayproject',
       credential: 'openrelayproject'
     }
-  ]
+  ],
+  iceCandidatePoolSize: 10
 };
 
 // --- Состояние ---
@@ -46,8 +48,9 @@ let currentRecvBytes = 0;
 
 let appliedOffer = false;
 let appliedAnswer = false;
-let appliedSenderIceCount = 0;
-let appliedReceiverIceCount = 0;
+
+// Очереди для ICE-кандидатов (пока не установлен RemoteDescription)
+const pendingIceCandidates = [];
 
 let sendingStarted = false;
 
@@ -215,7 +218,7 @@ function downloadBlob(blob, name) {
 }
 
 // ============================================
-// WebRTC
+// WebRTC Logic
 // ============================================
 function createPeerConnection() {
   log('Создаю RTCPeerConnection');
@@ -238,8 +241,11 @@ function createPeerConnection() {
 
   pc.onconnectionstatechange = () => {
     log('PC state:', pc.connectionState);
-    if (pc.connectionState === 'failed' || pc.connectionState === 'disconnected') {
-      waitStatus.textContent = 'Соединение потеряно';
+    if (pc.connectionState === 'failed') {
+      waitStatus.textContent = 'Ошибка P2P соединения (NAT/Firewall)';
+      waitStatus.className = 'status err';
+    } else if (pc.connectionState === 'disconnected') {
+      waitStatus.textContent = 'Соединение временно прервано...';
       waitStatus.className = 'status err';
     }
   };
@@ -258,18 +264,27 @@ function createPeerConnection() {
   return pc;
 }
 
-function waitForIceGathering(pc) {
-  return new Promise((resolve) => {
-    if (pc.iceGatheringState === 'complete') return resolve();
-    const check = () => {
-      if (pc.iceGatheringState === 'complete') {
-        pc.removeEventListener('icegatheringstatechange', check);
-        resolve();
-      }
-    };
-    pc.addEventListener('icegatheringstatechange', check);
-    setTimeout(resolve, 2500); // Таймаут на случай медленных кандидатов
-  });
+async function processCandidate(candidate) {
+  if (!pc || !pc.remoteDescription || !pc.remoteDescription.type) {
+    pendingIceCandidates.push(candidate);
+    return;
+  }
+  try {
+    await pc.addIceCandidate(new RTCIceCandidate(candidate));
+  } catch (e) {
+    console.warn('[ICE Add Error]', e);
+  }
+}
+
+async function flushPendingCandidates() {
+  while (pendingIceCandidates.length > 0) {
+    const candidate = pendingIceCandidates.shift();
+    try {
+      await pc.addIceCandidate(new RTCIceCandidate(candidate));
+    } catch (e) {
+      console.warn('[ICE Flush Error]', e);
+    }
+  }
 }
 
 function setupDataChannel() {
@@ -440,50 +455,43 @@ downloadAllBtn.addEventListener('click', () => {
 async function handleRoomUpdate(data) {
   if (!pc) return;
 
-  // OFFER (Receiver)
+  // 1. OFFER (Receiver side)
   if (role === 'receiver' && data.offer && !appliedOffer) {
     appliedOffer = true;
     try {
       await pc.setRemoteDescription(new RTCSessionDescription(data.offer));
+      await flushPendingCandidates();
+
       const answer = await pc.createAnswer();
       await pc.setLocalDescription(answer);
-
-      await waitForIceGathering(pc);
       await setAnswer(roomId, pc.localDescription.sdp);
     } catch (e) {
       console.error('[handle offer]', e);
     }
   }
 
-  // ANSWER (Sender)
+  // 2. ANSWER (Sender side)
   if (role === 'sender' && data.answer && !appliedAnswer) {
     appliedAnswer = true;
     try {
       await pc.setRemoteDescription(new RTCSessionDescription(data.answer));
+      await flushPendingCandidates();
     } catch (e) {
       console.error('[handle answer]', e);
     }
   }
 
-  // ICE от Sender -> Применяет Receiver
+  // 3. ICE-кандидаты от Sender
   if (role === 'receiver' && Array.isArray(data.iceSender)) {
-    const newOnes = data.iceSender.slice(appliedSenderIceCount);
-    appliedSenderIceCount = data.iceSender.length;
-    for (const c of newOnes) {
-      if (pc.remoteDescription) {
-        try { await pc.addIceCandidate(new RTCIceCandidate(c)); } catch (e) {}
-      }
+    for (const candidate of data.iceSender) {
+      await processCandidate(candidate);
     }
   }
 
-  // ICE от Receiver -> Применяет Sender
+  // 4. ICE-кандидаты от Receiver
   if (role === 'sender' && Array.isArray(data.iceReceiver)) {
-    const newOnes = data.iceReceiver.slice(appliedReceiverIceCount);
-    appliedReceiverIceCount = data.iceReceiver.length;
-    for (const c of newOnes) {
-      if (pc.remoteDescription) {
-        try { await pc.addIceCandidate(new RTCIceCandidate(c)); } catch (e) {}
-      }
+    for (const candidate of data.iceReceiver) {
+      await processCandidate(candidate);
     }
   }
 }
@@ -503,8 +511,6 @@ async function startAsSender() {
 
   const offer = await pc.createOffer();
   await pc.setLocalDescription(offer);
-
-  await waitForIceGathering(pc);
   await setOffer(roomId, pc.localDescription.sdp);
 
   unsubRoom = listenRoom(roomId, handleRoomUpdate);
