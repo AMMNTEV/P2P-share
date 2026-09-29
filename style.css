@@ -227,3 +227,85 @@ h1::after  { content: ' ]'; color: #444; }
   color: #888;
   text-align: right;
 }
+
+/* ==== файлы: список ==== */
+.files-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  max-height: 260px;
+  overflow-y: auto;
+  background: #050505;
+  border: 1px solid #2a2a2a;
+  padding: 8px;
+}
+
+.files-list.compact {
+  padding: 6px 8px;
+  max-height: 180px;
+}
+
+.file-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 8px;
+  background: #0a0a0a;
+  border: 1px solid #1a1a1a;
+  font-size: 12px;
+}
+
+.file-item-name {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: #d0d0d0;
+}
+
+.file-item-size {
+  color: #666;
+  flex-shrink: 0;
+  font-size: 11px;
+}
+
+.file-item-remove {
+  background: transparent;
+  border: none;
+  color: #666;
+  cursor: pointer;
+  padding: 0 4px;
+  font-family: inherit;
+  font-size: 14px;
+  line-height: 1;
+  transition: color 0.15s;
+  flex-shrink: 0;
+}
+
+.file-item-remove:hover {
+  color: #f66;
+}
+
+.file-item.done .file-item-name {
+  color: #6f6;
+}
+
+.file-item.done .file-item-name::after {
+  content: ' ✓';
+  color: #6f6;
+}
+
+/* ==== итог по файлам ==== */
+.files-total {
+  display: flex;
+  justify-content: space-between;
+  font-size: 11px;
+  color: #888;
+  padding: 2px 0;
+}
+
+/* ==== кнопка "Скачать все" — чуть выделим ==== */
+#downloadAllBtn {
+  color: #6f6;
+  border-color: #2a4a2a;
+}

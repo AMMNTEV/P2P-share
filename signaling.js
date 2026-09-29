@@ -1,12 +1,13 @@
 // ============================================
 // signaling.js — сигналинг через Firestore
-// Структура: rooms/{roomId} — { sender, receiver }
-//            rooms/{roomId}/signals/{id} — { from, to, ... }
+// Структура:
+//   rooms/{roomId}            — документ комнаты
+//   rooms/{roomId}/signals/*  — SDP/ICE-сигналы
 // ============================================
 import { initializeApp } from "https://www.gstatic.com/firebasejs/10.8.1/firebase-app.js";
 import {
   getFirestore, doc, setDoc, getDoc, onSnapshot, deleteDoc,
-  collection, addDoc, query, where, getDocs, orderBy, limit
+  collection, addDoc, query, orderBy, getDocs
 } from "https://www.gstatic.com/firebasejs/10.8.1/firebase-firestore.js";
 
 const firebaseConfig = {
@@ -45,16 +46,31 @@ export async function joinRoom(roomId) {
   const data = snap.data();
   // TTL: 1 час
   if (Date.now() - data.createdAt > 60 * 60 * 1000) return false;
-  await setDoc(doc(db, 'rooms', roomId), {
-    receiver: true
-  }, { merge: true });
+  await setDoc(doc(db, 'rooms', roomId), { receiver: true }, { merge: true });
   return true;
 }
 
-export async function cleanupRoom(roomId, role) {
+/**
+ * Полная очистка комнаты:
+ * 1. Удаляем все документы из подколлекции signals
+ * 2. Удаляем сам документ комнаты
+ */
+export async function cleanupRoom(roomId) {
+  if (!roomId) return;
   try {
+    // 1. Удаляем все сигналы
+    const signalsRef = collection(db, 'rooms', roomId, 'signals');
+    const snap = await getDocs(signalsRef);
+    const deletes = [];
+    snap.forEach(d => deletes.push(deleteDoc(d.ref)));
+    await Promise.all(deletes);
+
+    // 2. Удаляем саму комнату
     await deleteDoc(doc(db, 'rooms', roomId));
-  } catch {}
+    console.log('[CLEANUP] room + signals deleted:', roomId);
+  } catch (e) {
+    console.warn('[CLEANUP]', e);
+  }
 }
 
 // ============================================
@@ -81,15 +97,13 @@ export function listenForSignal(roomId, myRole, handler) {
       const data = change.doc.data();
       const id = change.doc.id;
 
-      // Пропускаем свои сигналы и уже обработанные
       if (data.from === myRole) return;
       if (seen.has(id)) return;
       seen.add(id);
 
-      // Удаляем сигнал после обработки
+      // Удаляем сигнал сразу после обработки
       deleteDoc(doc(db, 'rooms', roomId, 'signals', id)).catch(() => {});
 
-      // Передаём в main.js
       handler(data);
     });
   });

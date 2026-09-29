@@ -1,14 +1,15 @@
 // ============================================
 // main.js — P2P передача файлов через WebRTC
+// Мультифайл + очистка Firestore
 // ============================================
 import {
   createRoom, joinRoom, listenForSignal,
   sendSignal, cleanupRoom, getRoomFromUrl
 } from './signaling.js';
 
-const CHUNK_SIZE = 16 * 1024;       // 16 KB — безопасный размер для DataChannel
-const BUFFER_THRESHOLD = 1024 * 1024; // 1 MB — порог для backpressure
-const BUFFER_LOW = 256 * 1024;       // 256 KB — до этого ждём
+const CHUNK_SIZE = 16 * 1024;
+const BUFFER_THRESHOLD = 1024 * 1024;
+const BUFFER_LOW = 256 * 1024;
 
 const RTC_CONFIG = {
   iceServers: [
@@ -20,12 +21,14 @@ const RTC_CONFIG = {
 // --- Состояние ---
 let pc = null;
 let dataChannel = null;
-let selectedFile = null;
+let selectedFiles = [];       // массив File
 let roomId = null;
-let role = null; // 'sender' | 'receiver'
-let receivedChunks = [];
-let receivedBytes = 0;
-let fileMeta = null;
+let role = null;              // 'sender' | 'receiver'
+let sentAllDone = false;
+let receivedFiles = [];       // [{name, mime, size, blob}]
+let currentRecvFile = null;   // файл в процессе приёма
+let currentRecvChunks = [];
+let currentRecvBytes = 0;
 
 // --- DOM ---
 const screens = {
@@ -37,15 +40,15 @@ const screens = {
 
 const fileInput = document.getElementById('fileInput');
 const dropzone = document.getElementById('dropzone');
-const fileInfo = document.getElementById('fileInfo');
-const fileName = document.getElementById('fileName');
-const fileSize = document.getElementById('fileSize');
+const filesList = document.getElementById('filesList');
+const filesTotal = document.getElementById('filesTotal');
+const filesCount = document.getElementById('filesCount');
+const filesTotalSize = document.getElementById('filesTotalSize');
 const createLinkBtn = document.getElementById('createLinkBtn');
 
 const linkInput = document.getElementById('linkInput');
 const copyLinkBtn = document.getElementById('copyLinkBtn');
-const waitFileName = document.getElementById('waitFileName');
-const waitFileSize = document.getElementById('waitFileSize');
+const waitFilesList = document.getElementById('waitFilesList');
 const waitStatus = document.getElementById('waitStatus');
 const sendProgress = document.getElementById('sendProgress');
 const sendProgressFill = document.getElementById('sendProgressFill');
@@ -54,13 +57,11 @@ const cancelSendBtn = document.getElementById('cancelSendBtn');
 
 const recvSubtitle = document.getElementById('recvSubtitle');
 const recvStatus = document.getElementById('recvStatus');
-const recvFileInfo = document.getElementById('recvFileInfo');
-const recvFileName = document.getElementById('recvFileName');
-const recvFileSize = document.getElementById('recvFileSize');
+const recvFilesList = document.getElementById('recvFilesList');
 const recvProgress = document.getElementById('recvProgress');
 const recvProgressFill = document.getElementById('recvProgressFill');
 const recvProgressText = document.getElementById('recvProgressText');
-const downloadBtn = document.getElementById('downloadBtn');
+const downloadAllBtn = document.getElementById('downloadAllBtn');
 const cancelRecvBtn = document.getElementById('cancelRecvBtn');
 
 const errorText = document.getElementById('errorText');
@@ -86,8 +87,112 @@ function showError(text) {
   showScreen('error');
 }
 
+function totalSize(files) {
+  return files.reduce((s, f) => s + f.size, 0);
+}
+
 // ============================================
-// WebRTC: создание peer connection
+// UI: список файлов (отправитель)
+// ============================================
+function renderFilesList() {
+  if (selectedFiles.length === 0) {
+    filesList.style.display = 'none';
+    filesTotal.style.display = 'none';
+    createLinkBtn.disabled = true;
+    return;
+  }
+
+  filesList.style.display = 'flex';
+  filesTotal.style.display = 'flex';
+  filesList.innerHTML = '';
+
+  selectedFiles.forEach((file, idx) => {
+    const item = document.createElement('div');
+    item.className = 'file-item';
+    item.innerHTML = `
+      <span class="file-item-name"></span>
+      <span class="file-item-size">${formatSize(file.size)}</span>
+      <button class="file-item-remove" title="Удалить">×</button>
+    `;
+    item.querySelector('.file-item-name').textContent = file.name;
+    item.querySelector('.file-item-remove').addEventListener('click', (e) => {
+      e.stopPropagation();
+      selectedFiles.splice(idx, 1);
+      renderFilesList();
+    });
+    filesList.appendChild(item);
+  });
+
+  const n = selectedFiles.length;
+  filesCount.textContent = n === 1 ? '1 файл' : n + ' файлов';
+  filesTotalSize.textContent = formatSize(totalSize(selectedFiles));
+  createLinkBtn.disabled = false;
+}
+
+function renderWaitFilesList() {
+  waitFilesList.innerHTML = '';
+  selectedFiles.forEach(file => {
+    const item = document.createElement('div');
+    item.className = 'file-item';
+    item.innerHTML = `
+      <span class="file-item-name"></span>
+      <span class="file-item-size">${formatSize(file.size)}</span>
+    `;
+    item.querySelector('.file-item-name').textContent = file.name;
+    waitFilesList.appendChild(item);
+  });
+}
+
+function markWaitFileDone(index) {
+  const items = waitFilesList.querySelectorAll('.file-item');
+  if (items[index]) items[index].classList.add('done');
+}
+
+// ============================================
+// UI: список файлов (получатель)
+// ============================================
+function renderRecvFilesList() {
+  recvFilesList.innerHTML = '';
+  receivedFiles.forEach((f, i) => {
+    const item = document.createElement('div');
+    item.className = 'file-item done';
+    item.innerHTML = `
+      <span class="file-item-name"></span>
+      <span class="file-item-size">${formatSize(f.size)}</span>
+      <button class="file-item-remove" title="Скачать">↓</button>
+    `;
+    item.querySelector('.file-item-name').textContent = f.name;
+    item.querySelector('.file-item-remove').addEventListener('click', () => {
+      downloadBlob(f.blob, f.name);
+    });
+    recvFilesList.appendChild(item);
+  });
+
+  if (currentRecvFile) {
+    const item = document.createElement('div');
+    item.className = 'file-item';
+    item.innerHTML = `
+      <span class="file-item-name"></span>
+      <span class="file-item-size">${formatSize(currentRecvFile.size)}</span>
+    `;
+    item.querySelector('.file-item-name').textContent = currentRecvFile.name;
+    recvFilesList.appendChild(item);
+  }
+}
+
+function downloadBlob(blob, name) {
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = name;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 60_000);
+}
+
+// ============================================
+// WebRTC
 // ============================================
 function createPeerConnection() {
   pc = new RTCPeerConnection(RTC_CONFIG);
@@ -109,15 +214,11 @@ function createPeerConnection() {
     }
   };
 
-  // Для отправителя: создаём DataChannel
   if (role === 'sender') {
-    dataChannel = pc.createDataChannel('file', {
-      ordered: true
-    });
+    dataChannel = pc.createDataChannel('file', { ordered: true });
     setupDataChannel();
   }
 
-  // Для получателя: ждём DataChannel
   if (role === 'receiver') {
     pc.ondatachannel = (event) => {
       dataChannel = event.channel;
@@ -129,7 +230,7 @@ function createPeerConnection() {
 }
 
 // ============================================
-// DataChannel: обработка
+// DataChannel
 // ============================================
 function setupDataChannel() {
   dataChannel.binaryType = 'arraybuffer';
@@ -140,7 +241,7 @@ function setupDataChannel() {
       waitStatus.textContent = 'Соединение установлено, отправка...';
       waitStatus.className = 'status ok';
       sendProgress.style.display = 'flex';
-      sendFile();
+      sendAllFiles();
     } else {
       recvStatus.textContent = 'Соединение установлено, приём...';
       recvStatus.className = 'status ok';
@@ -155,75 +256,115 @@ function setupDataChannel() {
     console.error('[DC]', e);
   };
 
-  // Получатель принимает данные
   if (role === 'receiver') {
-    dataChannel.onmessage = async (event) => {
+    dataChannel.onmessage = (event) => {
       const data = event.data;
 
-      // Первое сообщение — метаданные (JSON)
+      // Строковое сообщение — управляющее
       if (typeof data === 'string') {
-        try {
-          const msg = JSON.parse(data);
-          if (msg.type === 'meta') {
-            fileMeta = msg;
-            recvFileName.textContent = msg.name;
-            recvFileSize.textContent = formatSize(msg.size);
-            recvFileInfo.style.display = 'block';
-            recvProgress.style.display = 'flex';
-            recvSubtitle.textContent = 'Получение файла...';
-            return;
-          }
-          if (msg.type === 'end') {
-            onReceiveComplete();
-            return;
-          }
-        } catch (e) {
-          console.warn('Bad meta', e);
+        let msg;
+        try { msg = JSON.parse(data); } catch { return; }
+
+        if (msg.type === 'meta') {
+          // Начало нового файла
+          currentRecvFile = msg;
+          currentRecvChunks = [];
+          currentRecvBytes = 0;
+          recvSubtitle.textContent = 'Получение: ' + msg.name;
+          renderRecvFilesList();
+          recvProgress.style.display = 'flex';
+          recvProgressFill.style.width = '0%';
+          recvProgressText.textContent = '0%';
+          return;
         }
+
+        if (msg.type === 'end') {
+          // Завершение текущего файла
+          if (currentRecvFile) {
+            const blob = new Blob(currentRecvChunks, {
+              type: currentRecvFile.mime || 'application/octet-stream'
+            });
+            receivedFiles.push({
+              name: currentRecvFile.name,
+              mime: currentRecvFile.mime,
+              size: currentRecvFile.size,
+              blob
+            });
+            currentRecvFile = null;
+            currentRecvChunks = [];
+            currentRecvBytes = 0;
+            renderRecvFilesList();
+          }
+          return;
+        }
+
+        if (msg.type === 'all-done') {
+          // Все файлы получены
+          onAllReceived();
+          return;
+        }
+
         return;
       }
 
       // Бинарный чанк
-      receivedChunks.push(data);
-      receivedBytes += data.byteLength;
+      if (currentRecvFile) {
+        currentRecvChunks.push(data);
+        currentRecvBytes += data.byteLength;
 
-      if (fileMeta && fileMeta.size > 0) {
-        const percent = Math.min(100, Math.round((receivedBytes / fileMeta.size) * 100));
-        recvProgressFill.style.width = percent + '%';
-        recvProgressText.textContent = percent + '%';
+        const total = currentRecvFile.size;
+        if (total > 0) {
+          const percent = Math.min(100, Math.round((currentRecvBytes / total) * 100));
+          recvProgressFill.style.width = percent + '%';
+          recvProgressText.textContent = percent + '%';
+        }
       }
     };
   }
 }
 
 // ============================================
-// Отправитель: отправка файла
+// Отправитель: отправка всех файлов
 // ============================================
-async function sendFile() {
-  if (!selectedFile || !dataChannel) return;
+async function sendAllFiles() {
+  for (let i = 0; i < selectedFiles.length; i++) {
+    const file = selectedFiles[i];
+    await sendOneFile(file, i);
+    markWaitFileDone(i);
+  }
 
-  // Отправляем метаданные
+  // Все файлы отправлены
+  dataChannel.send(JSON.stringify({ type: 'all-done' }));
+  waitStatus.textContent = 'Все файлы отправлены ✓';
+  waitStatus.className = 'status ok';
+
+  // Очищаем Firestore — комната больше не нужна
+  if (roomId) {
+    await cleanupRoom(roomId);
+    roomId = null;
+    console.log('[CLEANUP] Firestore room deleted');
+  }
+}
+
+async function sendOneFile(file, index) {
+  // Метаданные
   dataChannel.send(JSON.stringify({
     type: 'meta',
-    name: selectedFile.name,
-    size: selectedFile.size,
-    mime: selectedFile.type || 'application/octet-stream'
+    name: file.name,
+    size: file.size,
+    mime: file.type || 'application/octet-stream',
+    index
   }));
 
-  const file = selectedFile;
   let offset = 0;
   let sentBytes = 0;
 
   while (offset < file.size) {
-    // Backpressure: ждём, пока буфер опустеет
     if (dataChannel.bufferedAmount > BUFFER_THRESHOLD) {
       await new Promise(resolve => {
         const check = () => {
-          if (dataChannel.bufferedAmount < BUFFER_LOW) {
-            resolve();
-          } else {
-            setTimeout(check, 20);
-          }
+          if (dataChannel.bufferedAmount < BUFFER_LOW) resolve();
+          else setTimeout(check, 20);
         };
         check();
       });
@@ -240,11 +381,8 @@ async function sendFile() {
     sendProgressText.textContent = percent + '%';
   }
 
-  // Сигнал окончания
+  // Конец файла
   dataChannel.send(JSON.stringify({ type: 'end' }));
-
-  waitStatus.textContent = 'Файл отправлен ✓';
-  waitStatus.className = 'status ok';
 }
 
 function readChunk(file, offset, size) {
@@ -257,37 +395,30 @@ function readChunk(file, offset, size) {
 }
 
 // ============================================
-// Получатель: собрать и скачать файл
+// Получатель: все получено
 // ============================================
-function onReceiveComplete() {
-  const blob = new Blob(receivedChunks, {
-    type: fileMeta?.mime || 'application/octet-stream'
-  });
-
-  const url = URL.createObjectURL(blob);
-  downloadBtn.style.display = 'block';
-  downloadBtn.onclick = () => {
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = fileMeta?.name || 'file';
-    document.body.appendChild(a);
-    a.click();
-    a.remove();
-  };
-
-  // Автоскачивание
-  const a = document.createElement('a');
-  a.href = url;
-  a.download = fileMeta?.name || 'file';
-  document.body.appendChild(a);
-  a.click();
-  a.remove();
-
-  recvStatus.textContent = 'Файл получен ✓';
+async function onAllReceived() {
+  recvStatus.textContent = `Получено файлов: ${receivedFiles.length} ✓`;
   recvStatus.className = 'status ok';
   recvProgressFill.style.width = '100%';
   recvProgressText.textContent = '100%';
+  downloadAllBtn.style.display = 'block';
+
+  // Очищаем Firestore — комната больше не нужна
+  if (roomId) {
+    await cleanupRoom(roomId);
+    roomId = null;
+    console.log('[CLEANUP] Firestore room deleted');
+  }
 }
+
+// Кнопка «Скачать все»
+downloadAllBtn.addEventListener('click', () => {
+  receivedFiles.forEach((f, i) => {
+    // Небольшая задержка, чтобы браузер не блокировал множественные скачивания
+    setTimeout(() => downloadBlob(f.blob, f.name), i * 300);
+  });
+});
 
 // ============================================
 // Обработка сигналов
@@ -307,13 +438,11 @@ async function handleSignal(data) {
         sdp: pc.localDescription.sdp
       });
     }
-
     else if (data.type === 'answer') {
       await pc.setRemoteDescription(new RTCSessionDescription({
         type: 'answer', sdp: data.sdp
       }));
     }
-
     else if (data.type === 'ice') {
       await pc.addIceCandidate(new RTCIceCandidate(data.candidate));
     }
@@ -323,7 +452,7 @@ async function handleSignal(data) {
 }
 
 // ============================================
-// Роль: SENDER
+// SENDER
 // ============================================
 async function startAsSender() {
   role = 'sender';
@@ -333,30 +462,21 @@ async function startAsSender() {
   url.searchParams.set('r', roomId);
   linkInput.value = url.toString();
 
-  waitFileName.textContent = selectedFile.name;
-  waitFileSize.textContent = formatSize(selectedFile.size);
-
+  renderWaitFilesList();
   showScreen('wait');
 
-  // Создаём PC, оффер
   createPeerConnection();
 
   const offer = await pc.createOffer();
   await pc.setLocalDescription(offer);
-
-  // Ждём ICE gathering
   await waitForIce(pc);
 
-  // Отправляем оффер через Firestore
   await sendSignal(roomId, 'sender', {
     type: 'offer',
     sdp: pc.localDescription.sdp
   });
 
-  // Слушаем ответ
-  listenForSignal(roomId, 'sender', (data) => {
-    handleSignal(data);
-  });
+  listenForSignal(roomId, 'sender', handleSignal);
 }
 
 function waitForIce(pc) {
@@ -374,7 +494,7 @@ function waitForIce(pc) {
 }
 
 // ============================================
-// Роль: RECEIVER
+// RECEIVER
 // ============================================
 async function startAsReceiver(roomIdFromUrl) {
   role = 'receiver';
@@ -387,22 +507,16 @@ async function startAsReceiver(roomIdFromUrl) {
   }
 
   showScreen('receive');
-
-  // Создаём PC
   createPeerConnection();
 
-  // Слушаем оффер от отправителя
   listenForSignal(roomId, 'receiver', async (data) => {
-    if (data.type === 'offer') {
-      await handleSignal(data);
-    } else if (data.type === 'ice') {
-      await handleSignal(data);
-    }
+    if (data.type === 'offer') await handleSignal(data);
+    else if (data.type === 'ice') await handleSignal(data);
   });
 }
 
 // ============================================
-// UI: выбор файла
+// UI: выбор файлов
 // ============================================
 dropzone.addEventListener('click', () => fileInput.click());
 
@@ -419,29 +533,27 @@ dropzone.addEventListener('drop', (e) => {
   e.preventDefault();
   dropzone.classList.remove('dragover');
   if (e.dataTransfer.files.length) {
-    handleFile(e.dataTransfer.files[0]);
+    addFiles([...e.dataTransfer.files]);
   }
 });
 
 fileInput.addEventListener('change', () => {
   if (fileInput.files.length) {
-    handleFile(fileInput.files[0]);
+    addFiles([...fileInput.files]);
+    fileInput.value = '';
   }
 });
 
-function handleFile(file) {
-  selectedFile = file;
-  fileName.textContent = file.name;
-  fileSize.textContent = formatSize(file.size);
-  fileInfo.style.display = 'block';
-  createLinkBtn.disabled = false;
+function addFiles(files) {
+  selectedFiles = selectedFiles.concat(files);
+  renderFilesList();
 }
 
 // ============================================
 // UI: создать ссылку
 // ============================================
 createLinkBtn.addEventListener('click', async () => {
-  if (!selectedFile) return;
+  if (selectedFiles.length === 0) return;
   createLinkBtn.disabled = true;
   createLinkBtn.textContent = 'Создание...';
   try {
@@ -470,13 +582,13 @@ copyLinkBtn.addEventListener('click', async () => {
 // UI: отмена
 // ============================================
 cancelSendBtn.addEventListener('click', async () => {
-  if (roomId) await cleanupRoom(roomId, 'sender');
+  if (roomId) await cleanupRoom(roomId);
   if (pc) pc.close();
   location.href = location.pathname;
 });
 
 cancelRecvBtn.addEventListener('click', async () => {
-  if (roomId) await cleanupRoom(roomId, 'receiver');
+  if (roomId) await cleanupRoom(roomId);
   if (pc) pc.close();
   location.href = location.pathname;
 });
@@ -497,7 +609,6 @@ errorBackBtn.addEventListener('click', () => {
   }
 })();
 
-// Уборка при закрытии
 window.addEventListener('beforeunload', () => {
   if (pc) pc.close();
 });
